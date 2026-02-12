@@ -1006,42 +1006,6 @@ void clusterMigrationCommand(client *c) {
     }
 }
 
-/* Log a human-readable message for ASM task lifecycle events. */
-void asmLogTaskEvent(asmTask *task, int event) {
-    sds str = slotRangeArrayToString(task->slots);
-
-    switch (event) {
-        case ASM_EVENT_IMPORT_STARTED:
-            serverLog(LL_NOTICE, "Import task %s started for slots: %s", task->id, str);
-            break;
-        case ASM_EVENT_IMPORT_FAILED:
-            serverLog(LL_NOTICE, "Import task %s failed for slots: %s", task->id, str);
-            break;
-        case ASM_EVENT_TAKEOVER:
-            serverLog(LL_NOTICE, "Import task %s is ready to takeover slots: %s", task->id, str);
-            break;
-        case ASM_EVENT_IMPORT_COMPLETED:
-            serverLog(LL_NOTICE, "Import task %s completed for slots: %s", task->id, str);
-            break;
-        case ASM_EVENT_MIGRATE_STARTED:
-            serverLog(LL_NOTICE, "Migrate task %s started for slots: %s", task->id, str);
-            break;
-        case ASM_EVENT_MIGRATE_FAILED:
-            serverLog(LL_NOTICE, "Migrate task %s failed for slots: %s", task->id, str);
-            break;
-        case ASM_EVENT_HANDOFF_PREP:
-            serverLog(LL_NOTICE, "Migrate task %s preparing to handoff for slots: %s", task->id, str);
-            break;
-        case ASM_EVENT_MIGRATE_COMPLETED:
-            serverLog(LL_NOTICE, "Migrate task %s completed for slots: %s", task->id, str);
-            break;
-        default:
-            break;
-    }
-
-    sdsfree(str);
-}
-
 /* Notify the state change to the module and the cluster implementation. */
 void asmNotifyStateChange(asmTask *task, int event) {
     RedisModuleClusterSlotMigrationInfo info = {
@@ -1067,10 +1031,8 @@ void asmNotifyStateChange(asmTask *task, int event) {
 
     if (clusterNodeIsMaster(getMyClusterNode())) {
         /* Notify the cluster impl only if it is a real active import task. */
-        if (task != asmManager->master_task) {
-            asmLogTaskEvent(task, event);
+        if (task != asmManager->master_task)
             clusterAsmOnEvent(task->id, event, task->slots);
-        }
         asmNotifyReplicasStateChange(task); /* Propagate state change to replicas */
     }
 }
@@ -1214,8 +1176,7 @@ void asmImportTakeover(asmTask *task) {
     task->main_channel_conn = NULL;
 
     task->state = ASM_TAKEOVER;
-    asmLogTaskEvent(task, ASM_EVENT_TAKEOVER);
-    clusterAsmOnEvent(task->id, ASM_EVENT_TAKEOVER, task->slots);
+    clusterAsmOnEvent(task->id, ASM_EVENT_TAKEOVER, NULL);
 }
 
 void asmCallbackOnFreeClient(client *c) {
@@ -1744,20 +1705,15 @@ static void asmStartImportTask(asmTask *task) {
     /* Notify the cluster implementation to prepare for the import task. */
     int impl_ret = clusterAsmOnEvent(task->id, ASM_EVENT_IMPORT_PREP, task->slots);
 
-    /* We do not start the import task if trim is disabled by module. */
-    int disabled_by_module = server.cluster_module_trim_disablers > 0;
-
     static int start_blocked_logged = 0;
     /* Cannot start import task since pause action is performed. Otherwise, we
      * will break the promise that no writes are performed during the pause. */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL) ||
         isPausedActions(PAUSE_ACTION_CLIENT_WRITE) ||
         trim_in_progress ||
-        impl_ret != C_OK ||
-        disabled_by_module)
+        impl_ret != C_OK)
     {
-        const char *reason = disabled_by_module ? "trim is disabled by module" :
-                             impl_ret != C_OK ? "cluster is not ready" :
+        const char *reason = impl_ret != C_OK ? "cluster is not ready" :
                              trim_in_progress ? "trim in progress for some of the slots" :
                                                 "server paused";
         if (start_blocked_logged == 0) {
@@ -1793,6 +1749,9 @@ static void asmStartImportTask(asmTask *task) {
         serverLog(LL_NOTICE, "Import task %s source node changed: slots=%s, "
                              "new_source=%.40s", task->id, slots_str, clusterNodeGetName(source));
     }
+
+    serverLog(LL_NOTICE, "Import task %s starting: src=%.40s, dest=%.40s, slots=%s",
+                         task->id, task->source, task->dest, slots_str);
     sdsfree(slots_str);
 
     task->state = ASM_CONNECTING;
@@ -1879,14 +1838,6 @@ void clusterSyncSlotsCommand(client *c) {
             asmDebugIsFailPointActive(ASM_MIGRATE_MAIN_CHANNEL, ASM_NONE))
         {
             addReplyError(c, "-NOTREADY Cluster is not ready to migrate slots");
-            slotRangeArrayFree(slots);
-            return;
-        }
-
-        /* We do not start the migrate task if trim is disabled by module. */
-        int disabled_by_module = server.cluster_module_trim_disablers > 0;
-        if (disabled_by_module) {
-            addReplyError(c, "Trim is disabled by module");
             slotRangeArrayFree(slots);
             return;
         }
@@ -2072,7 +2023,6 @@ void clusterSyncSlotsCommand(client *c) {
                                          task->source_offset - task->dest_offset,
                                          server.asm_handoff_max_lag_bytes);
                     task->state = ASM_HANDOFF_PREP;
-                    asmLogTaskEvent(task, ASM_EVENT_HANDOFF_PREP);
                     clusterAsmOnEvent(task->id, ASM_EVENT_HANDOFF_PREP, task->slots);
                 }
             }
@@ -2996,12 +2946,6 @@ void asmTrimSlots(slotRangeArray *slots) {
  * in propagateNow(), as propagation is not allowed during a write pause. */
 void asmTrimJobSchedule(slotRangeArray *slots) {
     listAddNodeTail(asmManager->pending_trim_jobs, slotRangeArrayDup(slots));
-
-    /* If we call this function from beforeSleep, or cluster gossip message
-     * handlers instead of normal command handlers, we can try to process the
-     * trim job immediately. */
-    if (server.execution_nesting == 0)
-        asmTrimJobProcessPending();
 }
 
 /* Process any pending trim jobs. */
@@ -3015,22 +2959,15 @@ void asmTrimJobProcessPending(void) {
 
     /* Determine if we can start the trim job:
      * - require client writes not paused (so key deletions are allowed)
-     * - require replicas not paused (so TRIMSLOTS can be propagated).
-     * - require trim is not disabled via RedisModule_ClusterDisableTrim().
-     */
+     * - require replicas not paused (so TRIMSLOTS can be propagated). */
     static int logged = 0;
-    int disabled_by_module = server.cluster_module_trim_disablers > 0;
-
     if (isPausedActions(PAUSE_ACTION_CLIENT_WRITE) ||
         isPausedActions(PAUSE_ACTION_CLIENT_ALL) ||
-        isPausedActions(PAUSE_ACTION_REPLICA) ||
-        disabled_by_module)
+        isPausedActions(PAUSE_ACTION_REPLICA))
     {
         if (logged == 0) {
             logged = 1;
-            const char *reason = disabled_by_module ? "trim is disabled by module" :
-                                                      "pause action is in effect";
-            serverLog(LL_NOTICE, "Trim job is deferred since %s.", reason);
+            serverLog(LL_NOTICE, "Trim job will start after the write pause is lifted.");
         }
         return;
     }
@@ -3408,23 +3345,18 @@ void asmActiveTrimCycle(void) {
         return;
     }
 
-    /* Verify client pause is not in effect and trim is not disabled by module,
-     * so we can delete keys. */
+    /* Verify client pause is not in effect so we can delete keys. */
     static int blocked = 0;
-    int disabled_by_module = server.cluster_module_trim_disablers > 0;
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL) ||
-        isPausedActions(PAUSE_ACTION_CLIENT_WRITE) ||
-        disabled_by_module)
+        isPausedActions(PAUSE_ACTION_CLIENT_WRITE))
     {
         if (blocked == 0)  {
             blocked = 1;
-            const char *reason = disabled_by_module ? "trim is disabled by module" :
-                                                       "pause action is in effect";
-            serverLog(LL_NOTICE, "Active trim cycle is blocked since %s.", reason);
+            serverLog(LL_NOTICE, "Active trim cycle will continue after the write pause is lifted.");
         }
         return;
     }
-    if (blocked) serverLog(LL_NOTICE, "Active trim cycle is unblocked.");
+    if (blocked) serverLog(LL_NOTICE, "Active trim cycle is resumed after the write pause is lifted.");
     blocked = 0;
 
     /* This works in a similar way to activeExpireCycle, in the sense that
@@ -3482,10 +3414,28 @@ void asmActiveTrimCycle(void) {
     }
 }
 
-/* Check if the key in a trim job. */
-int asmIsKeyInTrimJob(sds keyname) {
-    if (!asmIsTrimInProgress() || !isSlotInTrimJob(getKeySlot(keyname)))
+/* Trim a specific key if trimming is pending or in progress for its slot.
+ * Return 1 if the key was trimmed */
+int asmActiveTrimDelIfNeeded(redisDb *db, robj *key, kvobj *kv) {
+    /* Check if trimming is in progress. */
+    if (server.allow_access_trimmed ||
+        !asmIsTrimInProgress())
+    {
         return 0;
+    }
+
+    /* Check if the slot is in a trim job. */
+    sds keyname = key ? key->ptr : kvobjGetKey(kv);
+    if (!isSlotInTrimJob(getKeySlot(keyname)))
+        return 0;
+
+    if (key) {
+        asmActiveTrimDeleteKey(db, key);
+    } else {
+        robj *tmpkey = createStringObject(keyname, sdslen(keyname));
+        asmActiveTrimDeleteKey(db, tmpkey);
+        decrRefCount(tmpkey);
+    }
     return 1;
 }
 

@@ -2175,20 +2175,15 @@ static int parseExpireTime(client *c, robj *o, int unit, long long basetime,
 #define HFE_FXX      (1<<6) /* Set fields if all the fields already exist */
 #define HFE_FNX      (1<<7) /* Set fields if none of the fields exist */
 
-/* Command types for unified hash argument parser */
-#define HASH_CMD_HGETEX 0
-#define HASH_CMD_HSETEX 1
-
-/* Parse hash field expiration command arguments for both HGETEX and HSETEX.
- * HGETEX <key> [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT unix-time-milliseconds|PERSIST]
- *              FIELDS <numfields> field [field ...]
- * HSETEX <key> [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT unix-time-milliseconds|KEEPTTL]
- *              [FXX|FNX] FIELDS <numfields> field value [field value ...]
- */
-static int parseHashFieldExpireArgs(client *c, int *flags,
-                                    long long *expire_time, int *expire_time_pos,
-                                    int *first_field_pos, int *field_count,
-                                    int command_type) {
+/* Parse hsetex command arguments.
+ * HSETEX <key>
+ *  [FNX|FXX]
+ *  [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT unix-time-milliseconds|KEEPTTL]
+ *  FIELDS <numfields> field value [field value ...]
+*/
+static int hsetexParseArgs(client *c, int *flags,
+                           long long *expire_time, int *expire_time_pos,
+                           int *first_field_pos, int *field_count) {
     *flags = 0;
     *first_field_pos = -1;
     *field_count = -1;
@@ -2196,10 +2191,9 @@ static int parseHashFieldExpireArgs(client *c, int *flags,
 
     for (int i = 2; i < c->argc; i++) {
         if (!strcasecmp(c->argv[i]->ptr, "fields")) {
-            int args_per_field = (command_type == HASH_CMD_HSETEX) ? 2 : 1;
             long val;
-            /* Ensure we have at least the numfields argument */
-            if (i + 1 >= c->argc) {
+
+            if (i >= c->argc - 3) {
                 addReplyErrorArity(c);
                 return C_ERR;
             }
@@ -2208,22 +2202,17 @@ static int parseHashFieldExpireArgs(client *c, int *flags,
                                               "invalid number of fields") != C_OK)
                 return C_ERR;
 
-            *first_field_pos = i + 2;
-            *field_count = (int) val;
-
-            /* Validate field count based on command type */
-            long long required_args = *first_field_pos + ((long long)*field_count * args_per_field);
-            if (required_args > c->argc) {
-                addReplyError(c, "wrong number of arguments");
+            int remaining = (c->argc - i  - 2);
+            if (remaining % 2 != 0 || val != remaining / 2) {
+                addReplyErrorArity(c);
                 return C_ERR;
             }
 
-            /* Skip over numfields and all field-value pairs
-             * Set i to the last position of the FIELDS block, loop will increment past it */
-            i = *first_field_pos + (*field_count * args_per_field) - 1;
-            continue;
+            *first_field_pos = i + 2;
+            *field_count = (int) val;
+            return C_OK;
         } else if (!strcasecmp(c->argv[i]->ptr, "EX")) {
-            if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_KEEPTTL | HFE_PERSIST))
+            if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_KEEPTTL))
                 goto err_expiration;
 
             if (i >= c->argc - 1)
@@ -2231,13 +2220,14 @@ static int parseHashFieldExpireArgs(client *c, int *flags,
 
             *flags |= HFE_EX;
             i++;
+
             if (parseExpireTime(c, c->argv[i], UNIT_SECONDS,
                                 commandTimeSnapshot(), expire_time) != C_OK)
                 return C_ERR;
 
             *expire_time_pos = i;
         } else if (!strcasecmp(c->argv[i]->ptr, "PX")) {
-            if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_KEEPTTL | HFE_PERSIST))
+            if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_KEEPTTL))
                 goto err_expiration;
 
             if (i >= c->argc - 1)
@@ -2251,7 +2241,7 @@ static int parseHashFieldExpireArgs(client *c, int *flags,
 
             *expire_time_pos = i;
         } else if (!strcasecmp(c->argv[i]->ptr, "EXAT")) {
-            if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_KEEPTTL | HFE_PERSIST))
+            if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_KEEPTTL))
                 goto err_expiration;
 
             if (i >= c->argc - 1)
@@ -2264,7 +2254,7 @@ static int parseHashFieldExpireArgs(client *c, int *flags,
 
             *expire_time_pos = i;
         } else if (!strcasecmp(c->argv[i]->ptr, "PXAT")) {
-            if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_KEEPTTL | HFE_PERSIST))
+            if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_KEEPTTL))
                 goto err_expiration;
 
             if (i >= c->argc - 1)
@@ -2277,10 +2267,6 @@ static int parseHashFieldExpireArgs(client *c, int *flags,
                 return C_ERR;
 
             *expire_time_pos = i;
-        } else if (!strcasecmp(c->argv[i]->ptr, "PERSIST")) {
-            if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_PERSIST))
-                goto err_expiration;
-            *flags |= HFE_PERSIST;
         } else if (!strcasecmp(c->argv[i]->ptr, "KEEPTTL")) {
             if (*flags & (HFE_EX | HFE_EXAT | HFE_PX | HFE_PXAT | HFE_KEEPTTL))
                 goto err_expiration;
@@ -2299,14 +2285,7 @@ static int parseHashFieldExpireArgs(client *c, int *flags,
         }
     }
 
-    /* Validate command-specific argument compatibility */
-    if ((command_type == HASH_CMD_HGETEX && (*flags & (HFE_KEEPTTL | HFE_FXX | HFE_FNX))) ||
-        (command_type == HASH_CMD_HSETEX && (*flags & HFE_PERSIST))) {
-        addReplyError(c, "unknown argument");
-        return C_ERR;
-    }
-
-    return C_OK;
+    serverAssert(0);
 
 err_missing_expire:
     addReplyError(c, "missing expire time");
@@ -2315,11 +2294,7 @@ err_condition:
     addReplyError(c, "Only one of FXX or FNX arguments can be specified");
     return C_ERR;
 err_expiration:
-    if (command_type == HASH_CMD_HSETEX) {
-        addReplyError(c, "Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments can be specified");
-    } else {
-        addReplyError(c, "Only one of EX, PX, EXAT, PXAT or PERSIST arguments can be specified");
-    }
+    addReplyError(c, "Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments can be specified");
     return C_ERR;
 }
 
@@ -2345,8 +2320,8 @@ void hsetexCommand(client *c) {
     dictEntryLink link;
     size_t oldsize = 0;
 
-    if (parseHashFieldExpireArgs(c, &flags, &expire_time, &expire_time_pos,
-                                 &first_field_pos, &field_count, HASH_CMD_HSETEX) != C_OK)
+    if (hsetexParseArgs(c, &flags, &expire_time, &expire_time_pos,
+                        &first_field_pos, &field_count) != C_OK)
         return;
 
     kvobj *o = lookupKeyWriteWithLink(c->db, c->argv[1], &link);
@@ -2653,7 +2628,7 @@ void hmgetCommand(client *c) {
     if (expired) {
         notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
         if (deleted)
-            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id); 
     }
 }
 
@@ -2768,9 +2743,10 @@ void hgetdelCommand(client *c) {
  */
 void hgetexCommand(client *c) {
     int expired = 0, deleted = 0, updated = 0;
-    int parse_flags = 0, expire_time_pos = -1, first_field_pos = -1, num_fields = -1;
-    long long expire_time = 0;
+    int num_fields_pos = 3, cond = 0;
+    long num_fields;
     int64_t oldlen = 0, newlen = -1;
+    long long expire_time = 0;
     HashTypeSetEx setex;
     size_t oldsize = 0;
 
@@ -2778,9 +2754,50 @@ void hgetexCommand(client *c) {
     if (checkType(c, o, OBJ_HASH))
         return;
 
-    /* Parse arguments using flexible parser */
-    if (parseHashFieldExpireArgs(c, &parse_flags, &expire_time, &expire_time_pos, &first_field_pos, &num_fields, HASH_CMD_HGETEX) != C_OK)
+    /* Read optional arg */
+    if (!strcasecmp(c->argv[2]->ptr, "ex"))
+        cond = HFE_EX;
+    else if (!strcasecmp(c->argv[2]->ptr, "px"))
+        cond = HFE_PX;
+    else if (!strcasecmp(c->argv[2]->ptr, "exat"))
+        cond = HFE_EXAT;
+    else if (!strcasecmp(c->argv[2]->ptr, "pxat"))
+        cond = HFE_PXAT;
+    else if (!strcasecmp(c->argv[2]->ptr, "persist"))
+        cond = HFE_PERSIST;
+
+    /* Parse expiration time */
+    if (cond & (HFE_EX | HFE_PX | HFE_EXAT | HFE_PXAT)) {
+        num_fields_pos += 2;
+        int unit = (cond & (HFE_EX | HFE_EXAT)) ? UNIT_SECONDS : UNIT_MILLISECONDS;
+        long long basetime = cond & (HFE_EX | HFE_PX) ? commandTimeSnapshot() : 0;
+        if (parseExpireTime(c, c->argv[3], unit, basetime, &expire_time) != C_OK)
+            return;
+    } else if (cond & HFE_PERSIST) {
+        num_fields_pos += 1;
+    }
+
+    /* Check if we have enough arguments */
+    if (num_fields_pos >= c->argc) {
+        addReplyErrorArity(c);
         return;
+    }
+
+    if (strcasecmp(c->argv[num_fields_pos - 1]->ptr, "FIELDS") != 0) {
+        addReplyError(c, "Mandatory argument FIELDS is missing or not at the right position");
+        return;
+    }
+
+    /* Read number of fields */
+    if (getRangeLongFromObjectOrReply(c, c->argv[num_fields_pos], 1, LONG_MAX, &num_fields,
+                                      "Number of fields must be a positive integer") != C_OK)
+        return;
+
+    /* Check number of fields is consistent with number of arguments */
+    if (num_fields != c->argc - num_fields_pos - 1) {
+        addReplyError(c, "The `numfields` parameter must match the number of arguments");
+        return;
+    }
 
     /* Non-existing keys and empty hashes are the same thing. Reply null if the
      * key does not exist.*/
@@ -2794,23 +2811,23 @@ void hgetexCommand(client *c) {
     if (server.memory_tracking_per_slot)
         oldsize = hashTypeAllocSize(o);
     oldlen = hashTypeLength(o, 0);
-    if (parse_flags)
+    if (cond)
         hashTypeSetExInit(c->argv[1], o, c, c->db, 0, &setex);
 
     addReplyArrayLen(c, num_fields);
-    for (int i = first_field_pos; i < first_field_pos + num_fields; i++) {
+    for (int i = num_fields_pos + 1; i < c->argc; i++) {
         const int flags = HFE_LAZY_NO_NOTIFICATION |
                           HFE_LAZY_NO_SIGNAL |
                           HFE_LAZY_AVOID_HASH_DEL |
                           HFE_LAZY_NO_UPDATE_KEYSIZES |
                           HFE_LAZY_NO_UPDATE_ALLOCSIZES;
         sds field = c->argv[i]->ptr;
-        int res = addHashFieldToReply(c, o, c->argv[i]->ptr, flags);
+        int res = addHashFieldToReply(c, o, field, flags);
         expired += (res == GETF_EXPIRED);
 
         /* Set expiration only if the field exists and not expired lazily. */
-        if (res == GETF_OK && parse_flags) {
-            if (parse_flags & HFE_PERSIST)
+        if (res == GETF_OK && cond) {
+            if (cond & HFE_PERSIST)
                 expire_time = EB_EXPIRE_TIME_INVALID;
 
             res = hashTypeSetEx(o, field, expire_time, &setex);
@@ -2819,7 +2836,7 @@ void hgetexCommand(client *c) {
         }
     }
 
-    if (parse_flags)
+    if (cond)
         hashTypeSetExDone(&setex);
 
     if (server.memory_tracking_per_slot)
@@ -2843,41 +2860,30 @@ void hgetexCommand(client *c) {
     if (expired)
         notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
     if (updated) {
-        /* Build canonical command for propagation */
-        int canonical_argc;
-        robj **canonical_argv;
-        int idx = 0;
-
-        if (parse_flags & HFE_PERSIST) {
+        if (cond & HFE_PERSIST) {
             notifyKeyspaceEvent(NOTIFY_HASH, "hpersist", c->argv[1], c->db->id);
-            /* Build canonical HPERSIST command: HPERSIST key FIELDS numfields field1 field2 ... */
-            canonical_argc = 4 + num_fields;
-            canonical_argv = zmalloc(sizeof(robj*) * canonical_argc);
-            canonical_argv[idx++] = shared.hpersist;
-            incrRefCount(shared.hpersist);
-            canonical_argv[idx++] = c->argv[1]; /* key */
-            incrRefCount(c->argv[1]);
+
+            /* Propagate as HPERSIST command.
+             * Orig: HGETEX <key> PERSIST FIELDS <numfields> field1 field2 ...
+             * Repl: HPERSIST <key> FIELDS <numfields> field1 field2 ... */
+            rewriteClientCommandArgument(c, 0, shared.hpersist);
+            rewriteClientCommandArgument(c, 2, NULL); /* Delete PERSIST arg */
         } else {
             notifyKeyspaceEvent(NOTIFY_HASH, "hexpire", c->argv[1], c->db->id);
-            /* Build canonical HPEXPIREAT command: HPEXPIREAT key timestamp FIELDS numfields field1 field2 ... */
-            canonical_argc = 5 + num_fields;
-            canonical_argv = zmalloc(sizeof(robj*) * canonical_argc);
-            canonical_argv[idx++] = shared.hpexpireat;
-            incrRefCount(shared.hpexpireat);
-            canonical_argv[idx++] = c->argv[1]; /* key */
-            incrRefCount(c->argv[1]);
-            canonical_argv[idx++] = createStringObjectFromLongLong(expire_time); /* timestamp */
-        }
 
-        canonical_argv[idx++] = shared.fields;
-        incrRefCount(shared.fields);
-        canonical_argv[idx++] = createStringObjectFromLongLong(num_fields);
-        for (int i = 0; i < num_fields; i++) {
-            canonical_argv[idx++] = c->argv[first_field_pos + i];
-            incrRefCount(c->argv[first_field_pos + i]);
-        }
+            /* Propagate as HPEXPIREAT command.
+             * Orig: HGETEX <key> [EX|PX|EXAT|PXAT] ttl FIELDS <numfields> field1 field2 ...
+             * Repl: HPEXPIREAT <key> ttl FIELDS <numfields> field1 field2 ... */
+            rewriteClientCommandArgument(c, 0, shared.hpexpireat);
+            rewriteClientCommandArgument(c, 2, NULL); /* Del [EX|PX|EXAT|PXAT]*/
 
-        replaceClientCommandVector(c, canonical_argc, canonical_argv);
+            /* Rewrite TTL if it is not unix time milliseconds already. */
+            if (!(cond & HFE_PXAT)) {
+                robj *expire = createStringObjectFromLongLong(expire_time);
+                rewriteClientCommandArgument(c, 2, expire);
+                decrRefCount(expire);
+            }
+        }
     } else if (deleted) {
         /* If we are here, fields are deleted because new timestamp was in the
          * past. HDELs are already propagated as part of hashTypeSetEx(). */
@@ -2907,7 +2913,7 @@ void hdelCommand(client *c) {
     int64_t oldLen = (int64_t) hashTypeLength(o, 0);
     if (server.memory_tracking_per_slot)
         oldsize = hashTypeAllocSize(o);
-
+    
     /* Hash field expiration is optimized to avoid frequent update global HFE DS for
      * each field deletion. Eventually active-expiration will run and update or remove
      * the hash from global HFE DS gracefully. Nevertheless, statistic "subexpiry"
@@ -3536,7 +3542,7 @@ static ExpireAction onFieldExpire(eItem item, void *ctx) {
     /* update keysizes */
     unsigned long l = hashTypeLength(expCtx->hashObj, 0);
     updateKeysizesHist(expCtx->db, getKeySlot(key), OBJ_HASH, l, l - 1);
-
+    
     serverAssert(hashTypeDelete(expCtx->hashObj, hf, 0) == 1);
     if (server.memory_tracking_per_slot)
         updateSlotAllocSize(expCtx->db, getKeySlot(key), oldsize, hashTypeAllocSize(kv));
@@ -3560,99 +3566,8 @@ ExpireMeta *hashGetExpireMeta(const eItem hash) {
     }
 }
 
-/* Generic structure to hold parsed arguments for all hash field commands */
-typedef struct {
-    /* FIELDS arguments */
-    int fieldsPos;          /* Position of FIELDS keyword (-1 if not found) */
-    int numFieldsPos;       /* Position of numfields argument */
-    int firstFieldPos;      /* Position of first field */
-    int fieldCount;         /* Number of fields */
-
-    /* HEXPIRE family arguments */
-    int expireTimePos;      /* Position of expire time argument */
-    long long expireTime;   /* Parsed expire time */
-    int expireCondition;    /* HFE_NX, HFE_XX, HFE_GT, HFE_LT */
-} HashCommandArgs;
-
-/* Parser for HEXPIRE family commands with flexible keyword ordering.
- * Returns C_OK on success, C_ERR on error (with reply sent). */
-static int parseHashCommandArgs(client *c, HashCommandArgs *args,
-                                long long basetime, int unit)
-{
-    memset(args, 0, sizeof(*args));
-    args->fieldsPos = -1;
-    args->expireTimePos = 2;
-
-    if (parseExpireTime(c, c->argv[2], unit, basetime, &args->expireTime) != C_OK) {
-        return C_ERR;
-    }
-
-    /* Parse remaining arguments starting from position 3 */
-    for (int i = 3; i < c->argc; i++) {
-        char *arg = c->argv[i]->ptr;
-
-        /* FIELDS keyword - supported by ALL hash field commands */
-        if (!strcasecmp(arg, "FIELDS")) {
-            if (args->fieldsPos != -1) {
-                addReplyError(c, "FIELDS keyword specified multiple times");
-                return C_ERR;
-            }
-
-            if (i >= c->argc - 2) {
-                addReplyError(c, "FIELDS requires at least numfields and one field argument");
-                return C_ERR;
-            }
-
-            args->fieldsPos = i;
-            args->numFieldsPos = i + 1;
-            long numFields;
-            if (getRangeLongFromObjectOrReply(c, c->argv[args->numFieldsPos], 1, INT_MAX,
-                                              &numFields, "Parameter `numFields` should be greater than 0") != C_OK)
-                return C_ERR;
-
-            args->fieldCount = (int)numFields;
-            args->firstFieldPos = i + 2;
-
-            /* Check bounds - we must have exactly the right number of fields */
-            if (args->firstFieldPos + args->fieldCount > c->argc) {
-                addReplyError(c, "wrong number of arguments");
-                return C_ERR;
-            }
-
-            /* Skip over the field arguments */
-            i = args->firstFieldPos + args->fieldCount - 1;
-            continue;
-        }
-
-        /* Expiration condition keywords - validation moved outside loop for performance */
-        if (!strcasecmp(arg, "NX")) {
-            args->expireCondition |= HFE_NX;
-            continue;
-        } else if (!strcasecmp(arg, "XX")) {
-            args->expireCondition |= HFE_XX;
-            continue;
-        } else if (!strcasecmp(arg, "GT")) {
-            args->expireCondition |= HFE_GT;
-            continue;
-        } else if (!strcasecmp(arg, "LT")) {
-            args->expireCondition |= HFE_LT;
-            continue;
-        }
-
-        addReplyErrorFormat(c, "unknown argument: %s", (char*) c->argv[i]->ptr);
-        return C_ERR;
-    }
-
-    if (__builtin_popcount(args->expireCondition & (HFE_NX|HFE_XX|HFE_GT|HFE_LT)) > 1) {
-        addReplyError(c, "Multiple condition flags specified");
-        return C_ERR;
-    }
-
-    return C_OK;
-}
-
 /* HTTL key <FIELDS count field [field ...]>  */
-static void httlGenericCommand(client *c, const char *cmd, long long basetime, int unit){
+static void httlGenericCommand(client *c, const char *cmd, long long basetime, int unit) {
     UNUSED(cmd);
     kvobj *hashObj;
     long numFields = 0, numFieldsAt = 3;
@@ -3812,10 +3727,11 @@ static void httlGenericCommand(client *c, const char *cmd, long long basetime, i
  *   propagated for given key.
  */
 static void hexpireGenericCommand(client *c, long long basetime, int unit) {
-    HashCommandArgs args;
-    int fieldsNotSet = 0, updated = 0, deleted = 0;
+    long numFields = 0, numFieldsAt = 4;
+    long long expire; /* unix time in msec */
+    int fieldAt, fieldsNotSet = 0, expireSetCond = 0, updated = 0, deleted = 0;
     int64_t oldlen, newlen;
-    robj *keyArg = c->argv[1];
+    robj *keyArg = c->argv[1], *expireArg = c->argv[2];
     size_t oldsize = 0;
 
     /* Read the hash object */
@@ -3823,15 +3739,43 @@ static void hexpireGenericCommand(client *c, long long basetime, int unit) {
     if (checkType(c, hashObj, OBJ_HASH))
         return;
 
-    /* Parse arguments using flexible keyword-based parsing */
-    if (parseHashCommandArgs(c, &args, basetime, unit) != C_OK)
+    /* Read the expiry time from command */
+    if (parseExpireTime(c, expireArg, unit, basetime, &expire) != C_OK)
         return;
+
+    /* Read optional expireSetCond [NX|XX|GT|LT] */
+    char *optArg = c->argv[3]->ptr;
+    if (!strcasecmp(optArg, "nx")) {
+        expireSetCond = HFE_NX; ++numFieldsAt;
+    } else if (!strcasecmp(optArg, "xx")) {
+        expireSetCond = HFE_XX; ++numFieldsAt;
+    } else if (!strcasecmp(optArg, "gt")) {
+        expireSetCond = HFE_GT; ++numFieldsAt;
+    } else if (!strcasecmp(optArg, "lt")) {
+        expireSetCond = HFE_LT; ++numFieldsAt;
+    }
+
+    if (strcasecmp(c->argv[numFieldsAt-1]->ptr, "FIELDS")) {
+        addReplyError(c, "Mandatory argument FIELDS is missing or not at the right position");
+        return;
+    }
+
+    /* Read number of fields */
+    if (getRangeLongFromObjectOrReply(c, c->argv[numFieldsAt], 1, LONG_MAX,
+                                      &numFields, "Parameter `numFields` should be greater than 0") != C_OK)
+        return;
+
+    /* Verify `numFields` is consistent with number of arguments */
+    if (numFields != (c->argc - numFieldsAt - 1)) {
+        addReplyError(c, "The `numfields` parameter must match the number of arguments");
+        return;
+    }
 
     /* Non-existing keys and empty hashes are the same thing. It also means
      * fields in the command don't exist in the hash key. */
     if (!hashObj) {
-        addReplyArrayLen(c, args.fieldCount);
-        for (int i = 0; i < args.fieldCount; i++) {
+        addReplyArrayLen(c, numFields);
+        for (int i = 0; i < numFields; i++) {
             addReplyLongLong(c, HSETEX_NO_FIELD);
         }
         return;
@@ -3842,30 +3786,25 @@ static void hexpireGenericCommand(client *c, long long basetime, int unit) {
         oldsize = hashTypeAllocSize(hashObj);
 
     HashTypeSetEx exCtx;
-    hashTypeSetExInit(keyArg, hashObj, c, c->db, args.expireCondition, &exCtx);
-    addReplyArrayLen(c, args.fieldCount);
+    hashTypeSetExInit(keyArg, hashObj, c, c->db, expireSetCond, &exCtx);
+    addReplyArrayLen(c, numFields);
 
-    /* Lazy allocation of fieldsToRemove - only allocate when failures occur */
-    int *fieldsToRemove = NULL;
-    int removeCount = 0;
-
-    for (int i = 0; i < args.fieldCount; i++) {
-        int fieldPos = args.firstFieldPos + i;
-        sds field = c->argv[fieldPos]->ptr;
-        SetExRes res = hashTypeSetEx(hashObj, field, args.expireTime, &exCtx);
+    fieldAt = numFieldsAt + 1;
+    while (fieldAt < c->argc) {
+        sds field = c->argv[fieldAt]->ptr;
+        SetExRes res = hashTypeSetEx(hashObj, field, expire, &exCtx);
         updated += (res == HSETEX_OK);
         deleted += (res == HSETEX_DELETED);
 
         if (unlikely(res != HSETEX_OK)) {
-            if (fieldsToRemove == NULL) {
-                fieldsToRemove = zmalloc(sizeof(int) * (args.fieldCount > 0 ? args.fieldCount : 1));
-            }
-            /* Remember this field position for later removal from propagation */
-            fieldsToRemove[removeCount++] = fieldPos;
+            /* If the field was not set, prevent field propagation */
+            rewriteClientCommandArgument(c, fieldAt, NULL);
             fieldsNotSet = 1;
+        } else {
+            ++fieldAt;
         }
 
-        addReplyLongLong(c, res);
+        addReplyLongLong(c,res);
     }
 
     hashTypeSetExDone(&exCtx);
@@ -3896,32 +3835,27 @@ static void hexpireGenericCommand(client *c, long long basetime, int unit) {
      * not met) then it is useless and invalid to propagate command with no fields */
     if (updated == 0) {
         preventCommandPropagation(c);
-        zfree(fieldsToRemove);
         return;
     }
 
-    /* Handle propagation using command rewriting
-     * Rewrite to canonical HPEXPIREAT command */
-    if (c->cmd->proc != hpexpireatCommand) {
-        rewriteClientCommandArgument(c, 0, shared.hpexpireat);
-
-        robj *expireTimeObj = createStringObjectFromLongLong(args.expireTime);
-        rewriteClientCommandArgument(c, args.expireTimePos, expireTimeObj);
-        decrRefCount(expireTimeObj);
-    }
-
-    /* For partial failures, remove failed fields from the original command */
+    /* If some fields were dropped, rewrite the number of fields */
     if (fieldsNotSet) {
-        for (int i = removeCount - 1; i >= 0; i--) {
-            rewriteClientCommandArgument(c, fieldsToRemove[i], NULL);
-        }
-        robj *newFieldCount = createStringObjectFromLongLong(updated);
-        rewriteClientCommandArgument(c, args.fieldsPos + 1, newFieldCount);
-        decrRefCount(newFieldCount);
+        robj *numFieldsObj = createStringObjectFromLongLong(updated);
+        rewriteClientCommandArgument(c, numFieldsAt, numFieldsObj);
+        decrRefCount(numFieldsObj);
     }
 
-    if (fieldsToRemove)
-        zfree(fieldsToRemove);
+    /* Propagate as HPEXPIREAT millisecond-timestamp. Rewrite only if not already */
+    if (c->cmd->proc != hpexpireatCommand) {
+        rewriteClientCommandArgument(c,0,shared.hpexpireat);
+    }
+
+    /* rewrite expiration time to unix time in msec  */
+    if (basetime != 0 || unit == UNIT_SECONDS) {
+        robj *expireObj = createStringObjectFromLongLong(expire);
+        rewriteClientCommandArgument(c, 2, expireObj);
+        decrRefCount(expireObj);
+    }
 }
 
 /* HPEXPIRE key milliseconds [ NX | XX | GT | LT] FIELDS numfields <field [field ...]> */
