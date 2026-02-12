@@ -177,9 +177,9 @@ struct hdr_histogram;
 /* Instantaneous metrics tracking. */
 #define STATS_METRIC_SAMPLES 16     /* Number of samples per metric. */
 #define STATS_METRIC_COMMAND 0      /* Number of commands executed. */
-#define STATS_METRIC_NET_INPUT 1    /* Bytes read from network. */
+#define STATS_METRIC_NET_INPUT 1    /* Bytes read to network. */
 #define STATS_METRIC_NET_OUTPUT 2   /* Bytes written to network. */
-#define STATS_METRIC_NET_INPUT_REPLICATION 3   /* Bytes read from network during replication. */
+#define STATS_METRIC_NET_INPUT_REPLICATION 3   /* Bytes read to network during replication. */
 #define STATS_METRIC_NET_OUTPUT_REPLICATION 4   /* Bytes written to network during replication. */
 #define STATS_METRIC_EL_CYCLE 5     /* Number of eventloop cycled. */
 #define STATS_METRIC_EL_DURATION 6  /* Eventloop duration. */
@@ -2341,7 +2341,6 @@ struct redisServer {
                                       to set in order to suppress certain
                                       native Redis Cluster features. Check the
                                       REDISMODULE_CLUSTER_FLAG_*. */
-    int cluster_module_trim_disablers; /* Number of module requests to disable trimming */
     int cluster_allow_reads_when_down; /* Are reads allowed when the cluster
                                         is down? */
     int cluster_config_file_lock_fd;   /* cluster config fd, will be flocked. */
@@ -3832,7 +3831,6 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
 #define LOOKUP_WRITE (1<<3)          /* Delete expired keys even in replicas. */
 #define LOOKUP_NOEXPIRE (1<<4)       /* Avoid deleting lazy expired keys. */
 #define LOOKUP_ACCESS_EXPIRED (1<<5) /* Allow lookup to expired key. */
-#define LOOKUP_ACCESS_TRIMMED (1<<6) /* Allow lookup to key in slots being trimmed. */
 #define LOOKUP_NOEFFECTS (LOOKUP_NONOTIFY | LOOKUP_NOSTATS | LOOKUP_NOTOUCH | LOOKUP_NOEXPIRE) /* Avoid any effects from fetching the key */
 
 static inline kvobj *dictGetKV(const dictEntry *de) {return (kvobj *) dictGetKey(de);}
