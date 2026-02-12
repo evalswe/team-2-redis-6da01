@@ -239,24 +239,18 @@ sds activeDefragSds(sds sdsptr) {
     return NULL;
 }
 
-/* Defrag helper for hfield (entry) strings
+/* Defrag helper for hfield strings
  *
  * returns NULL in case the allocation wasn't moved.
  * when it returns a non-null value, the old pointer was already released
  * and should NOT be accessed. */
-Entry *activeDefragEntry(Entry *entry) {
-    /* Defrag the value if it's not embedded */
-    sds *valuePtr = entryGetValuePtrRef(entry);
-    if (valuePtr) {
-        sds new_value = activeDefragSds(*valuePtr);
-        if (new_value) *valuePtr = new_value;
-    }
-    void *ptr = entryGetAllocPtr(entry);
+hfield activeDefragHfield(hfield hf) {
+    void *ptr = hfieldGetAllocPtr(hf);
     void *newptr = activeDefragAlloc(ptr);
     if (newptr) {
-        size_t offset = (char*)entry - (char*)ptr;
-        entry = (Entry *)((char*)newptr + offset);
-        return entry;
+        size_t offset = hf - (char*)ptr;
+        hf = (char*)newptr + offset;
+        return hf;
     }
     return NULL;
 }
@@ -277,10 +271,10 @@ void *activeDefragHfieldAndUpdateRef(void *ptr, void *privdata) {
     serverAssert(link);
     dictUseStoredKeyApi(d, 0);
 
-    Entry *newEntry = activeDefragEntry(ptr);
-    if (newEntry)
-        dictSetKeyAtLink(d, newEntry, &link, 0);
-    return newEntry;
+    hfield newhf = activeDefragHfield(ptr);
+    if (newhf)
+        dictSetKeyAtLink(d, newhf, &link, 0);
+    return newhf;
 }
 
 /* Defrag helper for robj and/or string objects with expected refcount.
@@ -478,14 +472,14 @@ void activeDefragLuaScriptDictCallback(void *privdata, const dictEntry *de, dict
 void activeDefragHfieldDictCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     UNUSED(plink);
     dict *d = privdata;
-    Entry *newEntry = NULL, *entry = dictGetKey(de);
+    hfield newhf = NULL, hf = dictGetKey(de);
 
     /* If the hfield does not have TTL, we directly defrag it.
      * Fields with TTL are skipped here and will be defragmented later
      * during the hash expiry ebuckets defragmentation phase. */
-    if (entryGetExpiry(entry) == EB_EXPIRE_TIME_INVALID) {
-        if ((newEntry = activeDefragEntry(entry)))
-            dictSetKey(d, (dictEntry *)de, newEntry);
+    if (hfieldGetExpireTime(hf) == EB_EXPIRE_TIME_INVALID) {
+        if ((newhf = activeDefragHfield(hf)))
+            dictSetKey(d, (dictEntry *)de, newhf);
     }
 }
 
@@ -509,13 +503,13 @@ void activeDefragSdsDict(dict* d, int val_type) {
     } while (cursor != 0);
 }
 
-/* Defrag a dict with hfield key (no separate value - value is part of entry). */
+/* Defrag a dict with hfield key and sds value. */
 void activeDefragHfieldDict(dict *d) {
     unsigned long cursor = 0;
     dictDefragFunctions defragfns = {
-        .defragAlloc = activeDefragAlloc, /* Only defrag dictEntry */
+        .defragAlloc = activeDefragAlloc,
         .defragKey = NULL, /* Will be defragmented in activeDefragHfieldDictCallback. */
-        .defragVal = NULL  /* No separate value - value is part of the entry (hfield). */
+        .defragVal = (dictDefragAllocFunction *)activeDefragSds
     };
     do {
         cursor = dictScanDefrag(d, cursor, activeDefragHfieldDictCallback,
@@ -525,7 +519,7 @@ void activeDefragHfieldDict(dict *d) {
     /* Continue with defragmentation of hash fields that have with TTL.
      * During the dictionary defragmentaion above, we skipped fields with TTL,
      * Now we continue to defrag those fields by using the expiry buckets. */
-    if (d->type == &entryHashDictTypeWithHFE) {
+    if (d->type == &mstrHashDictTypeWithHFE) {
         cursor = 0;
         ebDefragFunctions eb_defragfns = {
             .defragAlloc = activeDefragAlloc,
@@ -678,7 +672,7 @@ void scanLaterHash(robj *ob, unsigned long *cursor) {
         dictDefragFunctions defragfns = {
             .defragAlloc = activeDefragAlloc,
             .defragKey = NULL, /* Will be defragmented in activeDefragHfieldDictCallback. */
-            .defragVal = NULL  /* value stored along with key as part of Entry */
+            .defragVal = (dictDefragAllocFunction *)activeDefragSds
         };
         *cursor = dictScanDefrag(d, *cursor, activeDefragHfieldDictCallback, &defragfns, d);
 
@@ -688,7 +682,7 @@ void scanLaterHash(robj *ob, unsigned long *cursor) {
 
     /* Defrag ebuckets and TTL fields. */
     if (defrag_phase == HASH_DEFRAG_EBUCKETS) {
-        if (d->type == &entryHashDictTypeWithHFE) {
+        if (d->type == &mstrHashDictTypeWithHFE) {
             ebDefragFunctions eb_defragfns = {
                 .defragAlloc = activeDefragAlloc,
                 .defragItem = activeDefragHfieldAndUpdateRef
