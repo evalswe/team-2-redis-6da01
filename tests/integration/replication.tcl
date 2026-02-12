@@ -321,7 +321,7 @@ start_server {tags {"repl external:skip"}} {
 }
 
 foreach mdl {no yes} rdbchannel {no yes} {
-    foreach sdl {disabled swapdb flushdb} {
+    foreach sdl {disabled swapdb} {
         start_server {tags {"repl external:skip debug_defrag:skip"} overrides {save {}}} {
             set master [srv 0 client]
             $master config set repl-diskless-sync $mdl
